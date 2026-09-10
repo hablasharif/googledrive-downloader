@@ -1,11 +1,11 @@
-name: Google Drive Batch Downloader
+name: Google Drive Batch & Folder Downloader
 
 on:
   # 1. Manual trigger from GitHub Actions tab with optional parameters
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Google Drive Links (one URL or ID per line, or leave empty to use config.yml)'
+        description: 'Google Drive Links (Single files, Folder URLs, or multiple links separated by newlines)'
         required: false
         type: string
         default: ''
@@ -35,7 +35,7 @@ on:
 
 jobs:
   download-files:
-    name: Download Google Drive Files
+    name: Download Google Drive Files & Folders
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -56,15 +56,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Execute Downloader
+        env:
+          INPUT_URLS: ${{ github.event.inputs.urls }}
+          MAX_WORKERS: ${{ github.event.inputs.max_workers || '4' }}
         run: |
           mkdir -p ./downloads
 
-          # Check if manual URLs were supplied via workflow_dispatch
-          if [ -n "${{ github.event.inputs.urls }}" ]; then
-            echo "Running download using workflow_dispatch URL inputs..."
+          if [ -n "$INPUT_URLS" ]; then
+            echo "Processing manual URLs from workflow_dispatch..."
+            # Write links to temporary text file safely preserving lines
+            printf "%s\n" "$INPUT_URLS" > input_urls.txt
+            cat input_urls.txt
             python downloader.py \
-              --urls ${{ github.event.inputs.urls }} \
-              --workers ${{ github.event.inputs.max_workers }} \
+              --file-list input_urls.txt \
+              --workers "$MAX_WORKERS" \
               --output ./downloads \
               --no-progress
           else
@@ -77,7 +82,9 @@ jobs:
 
       - name: Check Downloaded Files
         run: |
-          echo "Downloaded files list:"
+          echo "=========================================="
+          echo "Downloaded Files Directory Tree:"
+          echo "=========================================="
           ls -lhR ./downloads
 
       - name: Upload Downloaded Files as Artifacts

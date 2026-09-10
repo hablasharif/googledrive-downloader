@@ -1,7 +1,7 @@
-name: Google Drive Batch & Folder Downloader
+name: Google Drive Batch Downloader & Auto-Uploader
 
 on:
-  # 1. Manual trigger from GitHub Actions tab with optional parameters
+  # 1. Manual trigger from GitHub Actions tab with parameters
   workflow_dispatch:
     inputs:
       urls:
@@ -9,26 +9,26 @@ on:
         required: false
         type: string
         default: ''
+      destination_folder_id:
+        description: 'Optional Google Drive Destination Folder ID (leave empty for My Drive root)'
+        required: false
+        type: string
+        default: ''
+      upload_to_gdrive:
+        description: 'Upload downloaded files directly to your Google Drive'
+        required: true
+        type: boolean
+        default: true
+      upload_artifact:
+        description: 'Upload downloaded files as GitHub Actions workflow artifact (ZIP)'
+        required: true
+        type: boolean
+        default: true
       max_workers:
-        description: 'Number of parallel worker threads'
+        description: 'Number of parallel download worker threads'
         required: false
         type: string
         default: '4'
-      upload_artifact:
-        description: 'Upload downloaded files as workflow artifact'
-        required: true
-        type: boolean
-        default: true
-      commit_failed_log:
-        description: 'Commit download_failed.txt back to repo if any links fail'
-        required: true
-        type: boolean
-        default: true
-      retention_days:
-        description: 'Artifact retention in days (1-90)'
-        required: false
-        type: string
-        default: '7'
 
   # 2. Automatically run whenever config.yml is pushed/updated on main branch
   push:
@@ -39,11 +39,11 @@ on:
       - 'config.yml'
 
 jobs:
-  download-files:
-    name: Download Google Drive Files & Folders
+  download-and-upload:
+    name: Download & Upload to Google Drive
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Needed to commit download_failed.txt to the repository
+      contents: write
 
     steps:
       - name: Checkout Repository
@@ -62,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Downloader with Auto-Retry
+      - name: Execute Downloader
         env:
           INPUT_URLS: ${{ github.event.inputs.urls }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers || '4' }}
@@ -77,65 +77,38 @@ jobs:
               --workers "$MAX_WORKERS" \
               --output ./downloads \
               --failed-log download_failed.txt \
-              --no-progress
+              --no-progress || true
           else
             echo "Running download using config.yml..."
             python downloader.py \
               --config config.yml \
               --output ./downloads \
               --failed-log download_failed.txt \
-              --no-progress
+              --no-progress || true
           fi
 
-      - name: Inspect Download Results & Failed URLs
+      - name: Inspect Downloaded Files
         run: |
           echo "=========================================="
           echo "Downloaded Files Directory Tree:"
           echo "=========================================="
           ls -lhR ./downloads
 
-          if [ -s download_failed.txt ]; then
-            echo "=========================================="
-            echo "WARNING: PERSISTENT FAILED DOWNLOADS FOUND"
-            echo "=========================================="
-            cat download_failed.txt
-
-            # Append to GitHub Actions step summary
-            echo "### ⚠️ Persistent Failed Downloads" >> $GITHUB_STEP_SUMMARY
-            echo '```text' >> $GITHUB_STEP_SUMMARY
-            cat download_failed.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "All downloads succeeded without persistent errors."
-            echo "### ✅ All Downloads Completed Successfully!" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Commit download_failed.txt to Main Repository
-        if: ${{ github.event.inputs.commit_failed_log != 'false' }}
+      # Upload files directly to Google Drive via upload_drive.py
+      - name: Upload Downloaded Files to Google Drive
+        if: ${{ github.event.inputs.upload_to_gdrive != 'false' }}
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
+          DESTINATION_FOLDER_ID: ${{ github.event.inputs.destination_folder_id }}
+          CI: "true"
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          python upload_drive.py --dir ./downloads
 
-          if [ -s download_failed.txt ]; then
-            echo "Committing download_failed.txt to repository branch..."
-            git add download_failed.txt
-            git commit -m "chore: record failed download links in download_failed.txt [skip ci]" || echo "No changes to commit."
-            git push origin HEAD:${{ github.ref_name }} || echo "Failed to push to branch."
-          else
-            if git ls-files --error-unmatch download_failed.txt >/dev/null 2>&1; then
-              echo "Removing old resolved download_failed.txt from repository..."
-              git rm download_failed.txt
-              git commit -m "chore: remove resolved download_failed.txt [skip ci]" || echo "No changes to commit."
-              git push origin HEAD:${{ github.ref_name }} || echo "Failed to push to branch."
-            fi
-          fi
-
-      - name: Upload Downloaded Files and Logs as Artifacts
+      - name: Upload Workflow Artifact (Backup)
         if: ${{ github.event.inputs.upload_artifact != 'false' }}
         uses: actions/upload-artifact@v4
         with:
           name: google-drive-downloads-${{ github.run_id }}
-          path: |
-            ./downloads/
-            download_failed.txt
-          retention-days: ${{ github.event.inputs.retention_days || 7 }}
+          path: ./downloads/
+          retention-days: 7

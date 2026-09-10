@@ -1,0 +1,49 @@
+# ====================================================================
+# Google Drive Downloader Configuration
+# ====================================================================
+
+settings:
+  # Base destination folder for downloaded files
+  output_dir: "./downloads"
+
+  # Number of concurrent download worker threads
+  max_workers: 3
+
+  # Stream chunk size in Kilobytes (1024 KB = 1 MB)
+  chunk_size_kb: 1024
+
+  # Connection / Read timeout in seconds
+  timeout_seconds: 45
+
+  # Number of retry attempts on network failures
+  retry_attempts: 3
+
+  # Backoff delay between retries in seconds
+  retry_delay_seconds: 2
+
+  # Overwrite existing completed files (true/false)
+  # If false, complete files are skipped, and partial files are resumed
+  overwrite: false
+
+# ====================================================================
+# Target Files to Download
+# Supports:
+# - Standard View Link: https://drive.google.com/file/d/<FILE_ID>/view
+# - Direct Link:        https://drive.google.com/uc?id=<FILE_ID>&export=download
+# - Short/Open Link:    https://drive.google.com/open?id=<FILE_ID>
+# - Raw File ID:        <FILE_ID>
+# ====================================================================
+files:
+  # Example 1: Basic Google Drive file link (filename automatically detected)
+  - url: "https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing"
+    filename: "sample_archive.zip"
+    subdir: "archives"
+
+  # Example 2: Using raw file ID and custom filename
+  - url: "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+    filename: "sample_document.pdf"
+    subdir: "documents"
+
+  # Example 3: Additional links can be added below:
+  # - url: "https://drive.google.com/file/d/YOUR_FILE_ID_HERE/view"
+  #   filename: "custom_name.ext"

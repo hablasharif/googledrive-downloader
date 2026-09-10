@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Downloads directory and partial files
+downloads/
+*.part
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

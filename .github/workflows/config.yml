@@ -1,0 +1,48 @@
+# ====================================================================
+# Google Drive Multi-Link & Folder Downloader Configuration
+# ====================================================================
+
+settings:
+  # Base destination folder for downloaded files
+  output_dir: "./downloads"
+
+  # Number of concurrent download worker threads
+  max_workers: 4
+
+  # Stream chunk size in Kilobytes (1024 KB = 1 MB)
+  chunk_size_kb: 1024
+
+  # Connection / Read timeout in seconds
+  timeout_seconds: 45
+
+  # Number of retry attempts on network failures
+  retry_attempts: 3
+
+  # Backoff delay between retries in seconds
+  retry_delay_seconds: 2
+
+  # Overwrite existing completed files (true/false)
+  # If false, complete files are skipped, and partial files are resumed
+  overwrite: false
+
+  # Download engine: 'auto' (direct streaming with gdown fallback), 'direct', or 'gdown'
+  engine: "auto"
+
+# ====================================================================
+# Target Files & Folders to Download
+# Supports ANY Google Drive link type:
+# - Folder URLs:        https://drive.google.com/drive/folders/<FOLDER_ID>
+# - Standard View Link: https://drive.google.com/file/d/<FILE_ID>/view
+# - Direct Link:        https://drive.google.com/uc?id=<FILE_ID>&export=download
+# - Short/Open Link:    https://drive.google.com/open?id=<FILE_ID>
+# - Raw File ID:        <FILE_ID>
+# ====================================================================
+files:
+  # Example 1: Full Google Drive Folder (recursively downloads all files inside)
+  - url: "https://drive.google.com/drive/folders/1S4TlJa0_K78atNJBmgpXkI4T0Xz-Fw0r?usp=sharing"
+    subdir: "my_folder"
+
+  # Example 2: Individual file link
+  # - url: "https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing"
+  #   filename: "sample_archive.zip"
+  #   subdir: "archives"

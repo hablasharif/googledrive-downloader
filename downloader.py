@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 =============================================================================
 Advanced Google Drive Multi-Link & Folder Downloader

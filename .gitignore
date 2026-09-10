@@ -14,6 +14,10 @@ ENV/
 # Downloads directory and partial files
 downloads/
 *.part
+token.json
+input_urls.txt
+download_failed.txt
+
 
 # IDE & OS
 .vscode/

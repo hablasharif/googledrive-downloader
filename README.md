@@ -71,9 +71,19 @@ Execute using the YAML configuration:
 python downloader.py --config config.yml
 ```
 
-Or download directly via command line arguments:
+Or download directly via URL (positional argument or `--urls`):
 ```bash
-python downloader.py --urls "https://drive.google.com/drive/folders/1S4TlJa0_K78atNJBmgpXkI4T0Xz-Fw0r?usp=sharing" --workers 4 --output ./downloads
+python downloader.py "https://drive.google.com/file/d/1tLg9ftBUTT-Ku3x1JM8zpOsyQrkSn4jh/view"
+python downloader.py "https://drive.google.com/drive/folders/1S4TlJa0_K78atNJBmgpXkI4T0Xz-Fw0r?usp=sharing" --workers 4 --output ./downloads
+```
+
+Choose a download engine (`auto`, `direct`, or `gdown`):
+```bash
+# 'auto' uses direct streaming with automatic gdown fallback (recommended)
+python downloader.py "<URL>" --engine auto
+
+# Or force gdown engine directly:
+python downloader.py "<URL>" --engine gdown
 ```
 
 Or pass a text file containing links:
@@ -101,15 +111,31 @@ You can run this downloader directly on **GitHub Actions** to download Google Dr
    git push -u origin main
    ```
 
-### Step 2: Trigger the Workflow
+### Step 2: Set Up Google Drive Upload on GitHub (One-Time)
+Because GitHub Actions is a headless cloud environment, Google OAuth needs a **Refresh Token**:
+1. Run this command locally once on your computer:
+   ```bash
+   python get_refresh_token.py
+   ```
+   A browser window will open. Log into your Google account and click **Allow**.
+2. Copy the printed token and either:
+   - **Hardcode it** directly into `upload_drive.py`:
+     ```python
+     REFRESH_TOKEN = "your_printed_refresh_token_here"
+     ```
+   - **Or add it to GitHub Secrets** (Recommended):
+     Go to **GitHub Repo -> Settings -> Secrets and variables -> Actions -> New repository secret**:
+     - Name: `GDRIVE_REFRESH_TOKEN`
+     - Value: `your_printed_refresh_token_here`
+
+### Step 3: Trigger the Workflow on GitHub
 1. In your GitHub repository, navigate to the **Actions** tab.
-2. Select **"Google Drive Batch & Folder Downloader"** on the left menu.
+2. Select **"Google Drive Batch Downloader & Auto-Uploader"** on the left menu.
 3. Click **"Run workflow"**:
-   - Paste any Google Drive links (files, folders, or multiple links on separate lines) into the URL box.
-   - Or leave it blank to download the links defined in `config.yml`.
+   - Paste any Google Drive links into the **Google Drive Links** box (or leave blank to use `config.yml`).
+   - (Optional) Enter a **Destination Folder ID** on Google Drive.
+   - Leave **Upload downloaded files directly to your Google Drive** checked (`true`).
    - Click **"Run workflow"**.
 
-### Step 3: Download Your Files
-Once the workflow run completes:
-1. Click on the completed run in GitHub Actions.
-2. Under the **Artifacts** section at the bottom, click `google-drive-downloads-<run_id>` to download your zip file.
+GitHub Actions will download the files using GitHub's gigabit network and automatically upload them straight to your Google Drive account!
+

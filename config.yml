@@ -25,6 +25,9 @@ settings:
   # If false, complete files are skipped, and partial files are resumed
   overwrite: false
 
+  # Download engine: 'auto' (direct streaming with gdown fallback), 'direct', or 'gdown'
+  engine: "auto"
+
 # ====================================================================
 # Target Files & Folders to Download
 # Supports ANY Google Drive link type:

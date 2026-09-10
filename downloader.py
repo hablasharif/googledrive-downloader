@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-Advanced Google Drive Multi-Link Downloader
+Advanced Google Drive Multi-Link & Folder Downloader
 =============================================================================
 Author: Antigravity Assistant
-Description: High-performance, multi-threaded Google Drive file downloader
-             supporting large file confirmation bypass, stream resumption,
-             YAML batch configuration, and real-time progress visualization.
+Description: High-performance, multi-threaded Google Drive file and folder
+             downloader supporting large file confirmation bypass, stream
+             resumption, folder tree extraction, batch URL lists, YAML
+             configuration, and real-time progress visualization.
 =============================================================================
 """
 
@@ -21,7 +22,15 @@ from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import yaml
+
+# Try importing YAML parsers
+try:
+    import yaml
+except ImportError:
+    try:
+        from ruamel import yaml
+    except ImportError:
+        yaml = None
 
 # Optional rich UI integration with graceful fallback
 try:
@@ -42,11 +51,18 @@ except ImportError:
     RICH_AVAILABLE = False
     console = None
 
+# Optional gdown integration for folder extraction
+try:
+    import gdown
+    GDOWN_AVAILABLE = True
+except ImportError:
+    GDOWN_AVAILABLE = False
+
 
 class GoogleDriveURLParser:
-    """Extracts Google Drive file IDs from various URL formats."""
+    """Extracts Google Drive file or folder IDs and types from URLs."""
 
-    PATTERNS = [
+    FILE_PATTERNS = [
         # Standard sharing URL: https://drive.google.com/file/d/<ID>/view
         r"/file/d/([a-zA-Z0-9_-]+)",
         # Export / uc URL: https://drive.google.com/uc?id=<ID>
@@ -55,9 +71,22 @@ class GoogleDriveURLParser:
         r"/open\?id=([a-zA-Z0-9_-]+)",
         # Drive usercontent: https://drive.usercontent.google.com/download?id=<ID>
         r"drive\.usercontent\.google\.com/download\?id=([a-zA-Z0-9_-]+)",
-        # Folders URL: https://drive.google.com/drive/folders/<ID>
+    ]
+
+    FOLDER_PATTERNS = [
+        r"/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)",
         r"/folders/([a-zA-Z0-9_-]+)",
     ]
+
+    @classmethod
+    def is_folder_url(cls, url_or_id: str) -> bool:
+        """Determine whether URL points to a Google Drive folder."""
+        if not url_or_id:
+            return False
+        for pattern in cls.FOLDER_PATTERNS:
+            if re.search(pattern, url_or_id):
+                return True
+        return False
 
     @classmethod
     def extract_file_id(cls, url_or_id: str) -> Optional[str]:
@@ -67,16 +96,62 @@ class GoogleDriveURLParser:
 
         url_or_id = url_or_id.strip()
 
-        # Check if the string is already a raw ID (alphanumeric, -, _, length 25-45)
+        # Check if the string is already a raw ID
         if re.fullmatch(r"[a-zA-Z0-9_-]{25,50}", url_or_id):
             return url_or_id
 
-        for pattern in cls.PATTERNS:
+        for pattern in cls.FILE_PATTERNS:
+            match = re.search(pattern, url_or_id)
+            if match:
+                return match.group(1)
+
+        # Fallback to folder patterns if needed
+        for pattern in cls.FOLDER_PATTERNS:
             match = re.search(pattern, url_or_id)
             if match:
                 return match.group(1)
 
         return None
+
+    @classmethod
+    def extract_folder_items(cls, folder_url: str) -> List[Dict[str, Any]]:
+        """
+        Recursively extract all files inside a Google Drive folder,
+        preserving the relative directory tree.
+        """
+        if not GDOWN_AVAILABLE:
+            print("[Warning] `gdown` is required to crawl Google Drive folders.")
+            print("Please install it: pip install gdown")
+            return []
+
+        try:
+            items = gdown.download_folder(url=folder_url, skip_download=True, quiet=True)
+            targets: List[Dict[str, Any]] = []
+            seen_paths = set()
+
+            for item in items:
+                p = Path(item.path)
+                subdir = str(p.parent) if p.parent != Path(".") else None
+                filename = p.name
+
+                # Avoid duplicate filename collisions in the same directory
+                target_key = f"{subdir}/{filename}"
+                if target_key in seen_paths:
+                    stem = p.stem
+                    suffix = p.suffix
+                    filename = f"{stem}_{item.id[:6]}{suffix}"
+                    target_key = f"{subdir}/{filename}"
+                seen_paths.add(target_key)
+
+                targets.append({
+                    "url": item.id,
+                    "filename": filename,
+                    "subdir": subdir,
+                })
+            return targets
+        except Exception as e:
+            print(f"[Error] Failed to crawl folder {folder_url}: {e}")
+            return []
 
 
 class GoogleDriveDownloader:
@@ -109,9 +184,14 @@ class GoogleDriveDownloader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_session(self) -> requests.Session:
-        """Create a configured HTTP session."""
+        """Create a configured HTTP session with browser headers."""
         session = requests.Session()
-        session.headers.update({"User-Agent": self.USER_AGENT})
+        session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+        })
         return session
 
     def _extract_filename_from_headers(self, headers: Dict[str, str]) -> Optional[str]:
@@ -132,7 +212,6 @@ class GoogleDriveDownloader:
         name_match = re.search(r'filename="?([^";]+)"?', cd)
         if name_match:
             filename = name_match.group(1).strip()
-            # Clean possible trailing quotes
             return filename.strip('"\'')
 
         return None
@@ -146,7 +225,6 @@ class GoogleDriveDownloader:
         download_url = None
         detected_title = None
 
-        # Extract title if present: <title>filename - Google Drive</title>
         title_match = re.search(r"<title>(.*?)(?: - Google Drive)?</title>", html_text, re.IGNORECASE)
         if title_match:
             t = title_match.group(1).strip()
@@ -205,7 +283,7 @@ class GoogleDriveDownloader:
         content_type = resp.headers.get("content-type", "").lower()
         if "text/html" in content_type and resp.status_code == 200:
             html_text = resp.text
-            confirm_token, download_url, html_title = self._parse_html_confirmation(html_text)
+            confirm_token, download_url, _ = self._parse_html_confirmation(html_text)
 
             # Look for confirmation cookies
             if not confirm_token:
@@ -214,14 +292,13 @@ class GoogleDriveDownloader:
                         confirm_token = v
                         break
 
-            # Step 2: Retry with confirmation
+            # Step 2: Request with confirmation
             if download_url:
                 resp = session.get(download_url, headers=headers, stream=True, timeout=self.timeout)
             elif confirm_token:
                 params["confirm"] = confirm_token
                 resp = session.get(self.BASE_URL, params=params, headers=headers, stream=True, timeout=self.timeout)
             else:
-                # Direct usercontent fallback
                 usercontent_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
                 resp = session.get(usercontent_url, headers=headers, stream=True, timeout=self.timeout)
 
@@ -232,7 +309,6 @@ class GoogleDriveDownloader:
             elif resp.status_code == 403:
                 raise PermissionError("Access forbidden. File download quota may have been exceeded or requires sign-in.")
             elif resp.status_code == 416:
-                # Requested Range Not Satisfiable (file is already fully downloaded)
                 return resp, None, 0
             else:
                 raise RuntimeError(f"Server returned HTTP status code {resp.status_code}")
@@ -243,7 +319,6 @@ class GoogleDriveDownloader:
         # Determine total size
         total_size = 0
         if resp.status_code == 206:
-            # Format: Content-Range: bytes 1024-2047/2048
             cr = resp.headers.get("content-range", "")
             if cr and "/" in cr:
                 try:
@@ -292,14 +367,12 @@ class GoogleDriveDownloader:
             task_id = None
 
             try:
-                # Temporary file probe for resume
                 tentative_filename = custom_filename or f"gdrive_{file_id}.bin"
                 temp_dest = dest_dir / tentative_filename
                 part_file = dest_dir / f"{tentative_filename}.part"
 
                 # Check if already fully downloaded
                 if temp_dest.exists() and not self.overwrite:
-                    # Let's verify with HEAD or quick probe
                     file_size = temp_dest.stat().st_size
                     if file_size > 0:
                         return {
@@ -320,7 +393,6 @@ class GoogleDriveDownloader:
                     session, file_id, resume_offset=resume_offset
                 )
 
-                # If server returns 416, part_file is already complete
                 if resp.status_code == 416 and part_file.exists():
                     part_file.rename(temp_dest)
                     return {
@@ -332,9 +404,7 @@ class GoogleDriveDownloader:
                         "duration": time.time() - start_time,
                     }
 
-                # Finalize filename
                 final_name = custom_filename or remote_filename or tentative_filename
-                # Sanitize filename for local OS
                 final_name = re.sub(r'[\\/*?:"<>|]', "_", final_name)
                 final_dest = dest_dir / final_name
                 part_file = dest_dir / f"{final_name}.part"
@@ -346,7 +416,6 @@ class GoogleDriveDownloader:
                     write_mode = "wb"
                     downloaded_bytes = 0
 
-                # Setup progress bar if tracker provided
                 if progress_tracker:
                     task_id = progress_tracker.add_task(
                         description=f"[cyan]{final_name[:24]:<24}",
@@ -354,7 +423,6 @@ class GoogleDriveDownloader:
                         completed=downloaded_bytes,
                     )
 
-                # Write chunks to disk
                 with open(part_file, write_mode) as f:
                     for chunk in resp.iter_content(chunk_size=self.chunk_size):
                         if chunk:
@@ -364,7 +432,6 @@ class GoogleDriveDownloader:
                             if progress_tracker and task_id is not None:
                                 progress_tracker.update(task_id, advance=chunk_len)
 
-                # Complete download: rename .part to destination
                 if part_file.exists():
                     if final_dest.exists():
                         final_dest.unlink()
@@ -457,7 +524,7 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
         console.print()
         console.print(table)
         console.print(
-            f"[bold]Total Downloads:[/bold] {len(results)} | "
+            f"[bold]Total Files:[/bold] {len(results)} | "
             f"[bold green]Success:[/bold green] {success_count} | "
             f"[bold blue]Skipped:[/bold blue] {skip_count} | "
             f"[bold red]Failed:[/bold red] {fail_count} | "
@@ -485,6 +552,9 @@ def load_config_file(config_path: str) -> Tuple[Dict[str, Any], List[Dict[str, A
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
+    if yaml is None:
+        raise ImportError("No YAML parser found. Install PyYAML with `pip install pyyaml`.")
+
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
@@ -493,9 +563,25 @@ def load_config_file(config_path: str) -> Tuple[Dict[str, Any], List[Dict[str, A
     return settings, files
 
 
+def load_file_list(file_list_path: str) -> List[Dict[str, Any]]:
+    """Parse links from a plain text file (one URL/ID per line)."""
+    path = Path(file_list_path)
+    if not path.exists():
+        raise FileNotFoundError(f"URL list file not found: {file_list_path}")
+
+    targets = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            targets.append({"url": line, "filename": None, "subdir": None})
+    return targets
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced Google Drive Multi-Link Downloader",
+        description="Advanced Google Drive Multi-Link & Folder Downloader",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -505,9 +591,15 @@ def main():
         help="Path to YAML configuration file (e.g. config.yml)",
     )
     parser.add_argument(
+        "--file-list", "-f",
+        type=str,
+        default=None,
+        help="Path to a text file containing Google Drive links (one per line)",
+    )
+    parser.add_argument(
         "--urls", "-u",
         nargs="+",
-        help="One or more Google Drive URLs or file IDs to download directly",
+        help="One or more Google Drive URLs (file or folder) or file IDs",
     )
     parser.add_argument(
         "--output", "-o",
@@ -540,19 +632,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine files and settings
     config_settings = {}
     config_files = []
 
-    # Default to config.yml if it exists and no explicit arguments were supplied
     config_to_load = args.config
-    if not config_to_load and not args.urls and Path("config.yml").exists():
+    if not config_to_load and not args.urls and not args.file_list and Path("config.yml").exists():
         config_to_load = "config.yml"
 
     if config_to_load:
         config_settings, config_files = load_config_file(config_to_load)
 
-    # CLI arguments override YAML settings
     output_dir = args.output or config_settings.get("output_dir", "./downloads")
     max_workers = args.workers or config_settings.get("max_workers", 3)
     chunk_size_kb = args.chunk_size or config_settings.get("chunk_size_kb", 1024)
@@ -561,31 +650,60 @@ def main():
     retry_delay = config_settings.get("retry_delay_seconds", 2)
     overwrite = args.overwrite or config_settings.get("overwrite", False)
 
-    # Prepare file targets
-    targets: List[Dict[str, Any]] = []
+    initial_targets: List[Dict[str, Any]] = []
 
+    # 1. From CLI --file-list
+    if args.file_list:
+        initial_targets.extend(load_file_list(args.file_list))
+
+    # 2. From CLI --urls
     if args.urls:
         for u in args.urls:
-            targets.append({"url": u, "filename": None, "subdir": None})
+            initial_targets.append({"url": u, "filename": None, "subdir": None})
 
+    # 3. From YAML config
     for item in config_files:
         if isinstance(item, str):
-            targets.append({"url": item, "filename": None, "subdir": None})
+            initial_targets.append({"url": item, "filename": None, "subdir": None})
         elif isinstance(item, dict) and "url" in item:
-            targets.append({
+            initial_targets.append({
                 "url": item["url"],
                 "filename": item.get("filename"),
                 "subdir": item.get("subdir"),
             })
 
-    if not targets:
+    if not initial_targets:
         print("No Google Drive URLs or files specified!")
-        print("Provide URLs via `--urls <link1> <link2>` or in a `config.yml` file.")
+        print("Provide URLs via `--urls <link1> <link2>`, `--file-list links.txt`, or in `config.yml`.")
         parser.print_help()
         sys.exit(1)
 
+    # Expand folder URLs into individual file targets
+    expanded_targets: List[Dict[str, Any]] = []
+    for target in initial_targets:
+        url_candidate = target["url"]
+        if GoogleDriveURLParser.is_folder_url(url_candidate):
+            print(f"[Folder Detected] Crawling Google Drive folder: {url_candidate}")
+            folder_items = GoogleDriveURLParser.extract_folder_items(url_candidate)
+            print(f"Found {len(folder_items)} file(s) inside folder.")
+
+            for fi in folder_items:
+                item_subdir = fi["subdir"]
+                if target.get("subdir"):
+                    item_subdir = str(Path(target["subdir"]) / (item_subdir or ""))
+
+                expanded_targets.append({
+                    "url": fi["url"],
+                    "filename": fi["filename"],
+                    "subdir": item_subdir,
+                })
+        else:
+            expanded_targets.append(target)
+
+    targets = expanded_targets
+
     print(f"Starting Google Drive Downloader...")
-    print(f"Target count: {len(targets)} | Workers: {max_workers} | Output: {output_dir}")
+    print(f"Total files to download: {len(targets)} | Workers: {max_workers} | Output: {output_dir}")
 
     downloader = GoogleDriveDownloader(
         output_dir=output_dir,
@@ -597,8 +715,6 @@ def main():
     )
 
     results: List[Dict[str, Any]] = []
-
-    # Check if rich progress should be used
     use_rich_ui = RICH_AVAILABLE and not args.no_progress and sys.stdout.isatty()
 
     if use_rich_ui:
@@ -638,7 +754,6 @@ def main():
                             "duration": 0,
                         })
     else:
-        # Non-interactive / headless fallback
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
@@ -667,10 +782,8 @@ def main():
                         "duration": 0,
                     })
 
-    # Summary table
     print_summary_table(results)
 
-    # Return exit code 1 if all downloads failed
     if results and all(r.get("status") == "Failed" for r in results):
         sys.exit(1)
 

@@ -1,5 +1,5 @@
 # ====================================================================
-# Google Drive Downloader Configuration
+# Google Drive Multi-Link & Folder Downloader Configuration
 # ====================================================================
 
 settings:
@@ -7,7 +7,7 @@ settings:
   output_dir: "./downloads"
 
   # Number of concurrent download worker threads
-  max_workers: 3
+  max_workers: 4
 
   # Stream chunk size in Kilobytes (1024 KB = 1 MB)
   chunk_size_kb: 1024
@@ -26,24 +26,20 @@ settings:
   overwrite: false
 
 # ====================================================================
-# Target Files to Download
-# Supports:
+# Target Files & Folders to Download
+# Supports ANY Google Drive link type:
+# - Folder URLs:        https://drive.google.com/drive/folders/<FOLDER_ID>
 # - Standard View Link: https://drive.google.com/file/d/<FILE_ID>/view
 # - Direct Link:        https://drive.google.com/uc?id=<FILE_ID>&export=download
 # - Short/Open Link:    https://drive.google.com/open?id=<FILE_ID>
 # - Raw File ID:        <FILE_ID>
 # ====================================================================
 files:
-  # Example 1: Basic Google Drive file link (filename automatically detected)
-  - url: "https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing"
-    filename: "sample_archive.zip"
-    subdir: "archives"
+  # Example 1: Full Google Drive Folder (recursively downloads all files inside)
+  - url: "https://drive.google.com/drive/folders/1S4TlJa0_K78atNJBmgpXkI4T0Xz-Fw0r?usp=sharing"
+    subdir: "my_folder"
 
-  # Example 2: Using raw file ID and custom filename
-  - url: "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
-    filename: "sample_document.pdf"
-    subdir: "documents"
-
-  # Example 3: Additional links can be added below:
-  # - url: "https://drive.google.com/file/d/YOUR_FILE_ID_HERE/view"
-  #   filename: "custom_name.ext"
+  # Example 2: Individual file link
+  # - url: "https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing"
+  #   filename: "sample_archive.zip"
+  #   subdir: "archives"

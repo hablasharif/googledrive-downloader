@@ -52,12 +52,24 @@ except ImportError:
     RICH_AVAILABLE = False
     console = None
 
-# Optional gdown integration for folder extraction
+# Optional gdown integration for folder extraction and robust download fallback
 try:
     import gdown
+    try:
+        from gdown.download import get_url_from_gdrive_confirmation
+    except ImportError:
+        get_url_from_gdrive_confirmation = None
     GDOWN_AVAILABLE = True
 except ImportError:
     GDOWN_AVAILABLE = False
+    get_url_from_gdrive_confirmation = None
+
+# Optional BeautifulSoup for robust HTML form parsing
+try:
+    import bs4
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
 
 class GoogleDriveURLParser:
@@ -174,6 +186,7 @@ class GoogleDriveDownloader:
         retry_attempts: int = 3,
         retry_delay: int = 2,
         overwrite: bool = False,
+        engine: str = "auto",
     ):
         self.output_dir = Path(output_dir)
         self.chunk_size = chunk_size_kb * 1024
@@ -181,6 +194,7 @@ class GoogleDriveDownloader:
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
         self.overwrite = overwrite
+        self.engine = (engine or "auto").lower()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_session(self) -> requests.Session:
@@ -214,7 +228,9 @@ class GoogleDriveDownloader:
 
         return None
 
-    def _parse_html_confirmation(self, html_text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    def _parse_html_confirmation(
+        self, html_text: str, file_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
         Parse Google Drive large file warning HTML page.
         Returns (confirm_token, download_url, detected_title).
@@ -223,42 +239,106 @@ class GoogleDriveDownloader:
         download_url = None
         detected_title = None
 
+        # Check for title
         title_match = re.search(r"<title>(.*?)(?: - Google Drive)?</title>", html_text, re.IGNORECASE)
         if title_match:
             t = title_match.group(1).strip()
             if t and "Google Drive - Virus scan warning" not in t:
                 detected_title = t
 
-        # Pattern 1: Link href containing confirm=
-        link_match = re.search(r'href="(/uc\?[^"]*confirm=[^"]*)"', html_text)
-        if link_match:
-            download_url = urllib.parse.urljoin("https://drive.google.com", link_match.group(1).replace("&amp;", "&"))
-            token_match = re.search(r"confirm=([0-9A-Za-z_-]+)", download_url)
-            if token_match:
-                confirm_token = token_match.group(1)
+        # Also check for title/filename in warning text: e.g. <span class="uc-name-size"><a ...>filename</a>
+        if not detected_title:
+            name_match = re.search(r'<span[^>]*class=["\']uc-name-size["\'][^>]*><a[^>]*>([^<]+)</a>', html_text, re.IGNORECASE)
+            if name_match:
+                detected_title = name_match.group(1).strip()
 
-        # Pattern 2: Form action for direct download
+        # Method 1: Use gdown's specialized confirmation resolver if available
+        if GDOWN_AVAILABLE and get_url_from_gdrive_confirmation is not None:
+            try:
+                gdown_url = get_url_from_gdrive_confirmation(html_text)
+                if gdown_url:
+                    download_url = gdown_url
+                    m_confirm = re.search(r"[?&]confirm=([0-9A-Za-z_-]+)", download_url)
+                    if m_confirm:
+                        confirm_token = m_confirm.group(1)
+            except Exception:
+                pass
+
+        # Method 2: Parse #download-form using BeautifulSoup
+        if not download_url and BS4_AVAILABLE:
+            try:
+                soup = bs4.BeautifulSoup(html_text, features="html.parser")
+                form = soup.select_one("#download-form") or soup.find("form")
+                if form and form.get("action"):
+                    action = form["action"].replace("&amp;", "&")
+                    url_components = urllib.parse.urlsplit(action)
+                    query_params = urllib.parse.parse_qs(url_components.query)
+                    for inp in form.find_all("input"):
+                        name = inp.get("name")
+                        val = inp.get("value", "")
+                        if name:
+                            query_params[name] = [val]
+                            if name == "confirm":
+                                confirm_token = val
+                    query = urllib.parse.urlencode(query_params, doseq=True)
+                    download_url = urllib.parse.urlunsplit(url_components._replace(query=query))
+            except Exception:
+                pass
+
+        # Method 3: Pure-Python regex parser for form action and input tags
         if not download_url:
-            form_match = re.search(r'<form[^>]+action="([^"]+)"[^>]*>', html_text)
+            form_match = re.search(
+                r'<form[^>]*id=["\']download-form["\'][^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
+                html_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if not form_match:
+                form_match = re.search(
+                    r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
+                    html_text,
+                    re.DOTALL | re.IGNORECASE,
+                )
             if form_match:
-                download_url = form_match.group(1).replace("&amp;", "&")
+                action = form_match.group(1).replace("&amp;", "&")
+                form_body = form_match.group(2)
+                inputs = []
+                for inp_tag in re.findall(r'<input[^>]+>', form_body, re.IGNORECASE):
+                    name_m = re.search(r'name=["\']([^"\']+)["\']', inp_tag, re.IGNORECASE)
+                    val_m = re.search(r'value=["\']([^"\']*)["\']', inp_tag, re.IGNORECASE)
+                    if name_m:
+                        n = name_m.group(1)
+                        v = val_m.group(1) if val_m else ""
+                        inputs.append((n, v))
+                        if n == "confirm":
+                            confirm_token = v
 
-        # Pattern 3: Direct confirmation token in query or input tag
-        if not confirm_token:
-            token_match = re.search(r'name="confirm" value="([^"]+)"', html_text)
-            if token_match:
-                confirm_token = token_match.group(1)
+                url_components = urllib.parse.urlsplit(action)
+                query_params = urllib.parse.parse_qs(url_components.query)
+                for k, v in inputs:
+                    query_params[k] = [v]
+                query = urllib.parse.urlencode(query_params, doseq=True)
+                download_url = urllib.parse.urlunsplit(url_components._replace(query=query))
 
-        if not confirm_token:
-            token_match = re.search(r"confirm=([0-9A-Za-z_-]+)", html_text)
-            if token_match:
-                confirm_token = token_match.group(1)
-
-        # Pattern 4: Usercontent download link
+        # Method 4: Standard href containing confirm=
         if not download_url:
-            user_content_match = re.search(r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"', html_text)
-            if user_content_match:
-                download_url = user_content_match.group(1).replace("&amp;", "&")
+            link_match = re.search(r'href="(/uc\?[^"]*confirm=[^"]*)"', html_text)
+            if link_match:
+                download_url = urllib.parse.urljoin("https://drive.google.com", link_match.group(1).replace("&amp;", "&"))
+                token_match = re.search(r"confirm=([0-9A-Za-z_-]+)", download_url)
+                if token_match:
+                    confirm_token = token_match.group(1)
+
+        # Method 5: Embedded JSON downloadUrl
+        if not download_url:
+            json_match = re.search(r'"downloadUrl":"([^"]+)"', html_text)
+            if json_match:
+                download_url = json_match.group(1).replace("\\u003d", "=").replace("\\u0026", "&")
+
+        # Extract confirm token if not yet found
+        if not confirm_token:
+            token_match = re.search(r'name="confirm" value="([^"]+)"', html_text) or re.search(r"confirm=([0-9A-Za-z_-]+)", html_text)
+            if token_match:
+                confirm_token = token_match.group(1)
 
         return confirm_token, download_url, detected_title
 
@@ -279,9 +359,13 @@ class GoogleDriveDownloader:
 
         # Check if Google Drive returned virus confirmation HTML page
         content_type = resp.headers.get("content-type", "").lower()
+        remote_filename = None
+
         if "text/html" in content_type and resp.status_code == 200:
             html_text = resp.text
-            confirm_token, download_url, _ = self._parse_html_confirmation(html_text)
+            confirm_token, download_url, detected_title = self._parse_html_confirmation(html_text, file_id=file_id)
+            if detected_title:
+                remote_filename = detected_title
 
             if not confirm_token:
                 for k, v in session.cookies.items():
@@ -301,17 +385,28 @@ class GoogleDriveDownloader:
 
         # Check for error responses
         if resp.status_code not in (200, 206):
+            err_details = ""
+            if "text/html" in resp.headers.get("content-type", "").lower():
+                try:
+                    err_m = re.search(r'<p class="uc-error-subcaption">(.*?)</p>', resp.text, re.IGNORECASE)
+                    if err_m:
+                        err_details = f": {err_m.group(1).strip()}"
+                except Exception:
+                    pass
+
             if resp.status_code == 404:
-                raise FileNotFoundError("File not found or access denied (check permissions / link sharing).")
+                raise FileNotFoundError(f"File not found or access denied (check permissions / link sharing){err_details}")
             elif resp.status_code == 403:
-                raise PermissionError("Access forbidden. Download quota exceeded or sign-in required.")
+                raise PermissionError(f"Access forbidden. Download quota exceeded or sign-in required{err_details}")
             elif resp.status_code == 416:
-                return resp, None, 0
+                return resp, remote_filename, 0
             else:
-                raise RuntimeError(f"Server returned HTTP status code {resp.status_code}")
+                raise RuntimeError(f"Server returned HTTP status code {resp.status_code}{err_details}")
 
         # Determine filename
-        filename = self._extract_filename_from_headers(resp.headers)
+        extracted_name = self._extract_filename_from_headers(resp.headers)
+        if extracted_name:
+            remote_filename = extracted_name
 
         # Determine total size
         total_size = 0
@@ -330,7 +425,69 @@ class GoogleDriveDownloader:
                 except ValueError:
                     total_size = 0
 
-        return resp, filename, total_size
+        return resp, remote_filename, total_size
+
+    def _download_via_gdown(
+        self,
+        file_id: str,
+        dest_dir: Path,
+        custom_filename: Optional[str] = None,
+        progress_tracker: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Download file using gdown with resume and progress bar integration."""
+        if not GDOWN_AVAILABLE:
+            raise RuntimeError("gdown is not installed. Install with `pip install gdown`.")
+
+        start_time = time.time()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        task_id = None
+
+        target_file = dest_dir / custom_filename if custom_filename else None
+        output_arg = str(target_file) if target_file else (str(dest_dir) + os.sep)
+
+        def gdown_progress(downloaded: int, total: Optional[int]):
+            nonlocal task_id
+            if progress_tracker:
+                if task_id is None:
+                    desc_name = custom_filename or f"gdrive_{file_id[:8]}"
+                    task_id = progress_tracker.add_task(
+                        description=f"[cyan]{desc_name[:24]:<24}",
+                        total=total if (total and total > 0) else None,
+                        completed=downloaded,
+                    )
+                else:
+                    progress_tracker.update(task_id, completed=downloaded, total=total if (total and total > 0) else None)
+
+        try:
+            downloaded_path_str = gdown.download(
+                id=file_id,
+                output=output_arg,
+                quiet=True,
+                resume=not self.overwrite,
+                progress=gdown_progress if progress_tracker else None,
+            )
+
+            if not downloaded_path_str or not Path(downloaded_path_str).exists():
+                raise RuntimeError("gdown did not produce the expected downloaded file")
+
+            final_path = Path(downloaded_path_str)
+            file_size = final_path.stat().st_size
+
+            if progress_tracker and task_id is not None:
+                progress_tracker.update(task_id, completed=file_size)
+
+            return {
+                "file_id": file_id,
+                "filename": final_path.name,
+                "path": str(final_path),
+                "status": "Downloaded (gdown)",
+                "bytes_downloaded": file_size,
+                "duration": time.time() - start_time,
+            }
+        except Exception as e:
+            if progress_tracker and task_id is not None:
+                progress_tracker.remove_task(task_id)
+            raise e
 
     def download_file(
         self,
@@ -341,6 +498,7 @@ class GoogleDriveDownloader:
     ) -> Dict[str, Any]:
         """
         Download a single Google Drive file with retry, resume, and progress tracking.
+        Supports direct chunked streaming and gdown engine / fallback.
         """
         file_id = GoogleDriveURLParser.extract_file_id(url_or_id)
         if not file_id:
@@ -356,6 +514,41 @@ class GoogleDriveDownloader:
         dest_dir = self.output_dir / (subdir or "")
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        tentative_filename = custom_filename or f"gdrive_{file_id}.bin"
+        temp_dest = dest_dir / tentative_filename
+
+        # Check if already fully downloaded
+        if temp_dest.exists() and not self.overwrite:
+            file_size = temp_dest.stat().st_size
+            if file_size > 0:
+                return {
+                    "file_id": file_id,
+                    "filename": temp_dest.name,
+                    "path": str(temp_dest),
+                    "status": "Skipped (Exists)",
+                    "bytes_downloaded": file_size,
+                    "duration": 0,
+                }
+
+        # If gdown engine is explicitly selected
+        if self.engine == "gdown" and GDOWN_AVAILABLE:
+            try:
+                return self._download_via_gdown(
+                    file_id=file_id,
+                    dest_dir=dest_dir,
+                    custom_filename=custom_filename,
+                    progress_tracker=progress_tracker,
+                )
+            except Exception as exc:
+                return {
+                    "file_id": file_id,
+                    "filename": custom_filename or "Unknown",
+                    "status": "Failed",
+                    "error": f"gdown error: {exc}",
+                    "bytes_downloaded": 0,
+                    "duration": 0,
+                }
+
         last_error = None
         start_time = time.time()
 
@@ -364,22 +557,7 @@ class GoogleDriveDownloader:
             task_id = None
 
             try:
-                tentative_filename = custom_filename or f"gdrive_{file_id}.bin"
-                temp_dest = dest_dir / tentative_filename
                 part_file = dest_dir / f"{tentative_filename}.part"
-
-                # Check if already fully downloaded
-                if temp_dest.exists() and not self.overwrite:
-                    file_size = temp_dest.stat().st_size
-                    if file_size > 0:
-                        return {
-                            "file_id": file_id,
-                            "filename": temp_dest.name,
-                            "path": str(temp_dest),
-                            "status": "Skipped (Exists)",
-                            "bytes_downloaded": file_size,
-                            "duration": 0,
-                        }
 
                 resume_offset = 0
                 if part_file.exists() and not self.overwrite:
@@ -405,6 +583,18 @@ class GoogleDriveDownloader:
                 final_name = re.sub(r'[\\/*?:"<>|]', "_", final_name)
                 final_dest = dest_dir / final_name
                 part_file = dest_dir / f"{final_name}.part"
+
+                if final_dest.exists() and not self.overwrite:
+                    file_size = final_dest.stat().st_size
+                    if file_size > 0:
+                        return {
+                            "file_id": file_id,
+                            "filename": final_dest.name,
+                            "path": str(final_dest),
+                            "status": "Skipped (Exists)",
+                            "bytes_downloaded": file_size,
+                            "duration": time.time() - start_time,
+                        }
 
                 if resp.status_code == 206:
                     write_mode = "ab"
@@ -458,6 +648,18 @@ class GoogleDriveDownloader:
                     time.sleep(self.retry_delay * attempt)
             finally:
                 session.close()
+
+        # If direct stream failed after retries, try gdown fallback if engine is 'auto' and gdown is available
+        if self.engine == "auto" and GDOWN_AVAILABLE:
+            try:
+                return self._download_via_gdown(
+                    file_id=file_id,
+                    dest_dir=dest_dir,
+                    custom_filename=custom_filename,
+                    progress_tracker=progress_tracker,
+                )
+            except Exception as gdown_err:
+                last_error = f"{last_error} | gdown fallback error: {gdown_err}"
 
         return {
             "file_id": file_id,
@@ -701,9 +903,21 @@ def main():
         help="Path to a text file containing Google Drive links (one per line)",
     )
     parser.add_argument(
+        "positional_urls",
+        nargs="*",
+        help="Optional Google Drive URLs (file or folder) or file IDs passed as positional arguments",
+    )
+    parser.add_argument(
         "--urls", "-u",
         nargs="+",
         help="One or more Google Drive URLs (file or folder) or file IDs",
+    )
+    parser.add_argument(
+        "--engine",
+        type=str,
+        choices=["auto", "direct", "gdown"],
+        default=None,
+        help="Download engine: 'auto' (direct stream with gdown fallback), 'direct', or 'gdown'",
     )
     parser.add_argument(
         "--output", "-o",
@@ -751,7 +965,7 @@ def main():
     config_files = []
 
     config_to_load = args.config
-    if not config_to_load and not args.urls and not args.file_list and Path("config.yml").exists():
+    if not config_to_load and not args.urls and not args.positional_urls and not args.file_list and Path("config.yml").exists():
         config_to_load = "config.yml"
 
     if config_to_load:
@@ -764,14 +978,16 @@ def main():
     retry_attempts = config_settings.get("retry_attempts", 3)
     retry_delay = config_settings.get("retry_delay_seconds", 2)
     overwrite = args.overwrite or config_settings.get("overwrite", False)
+    engine = args.engine or config_settings.get("engine", "auto")
 
     initial_targets: List[Dict[str, Any]] = []
 
     if args.file_list:
         initial_targets.extend(load_file_list(args.file_list))
 
-    if args.urls:
-        for u in args.urls:
+    all_cli_urls = (args.urls or []) + (args.positional_urls or [])
+    if all_cli_urls:
+        for u in all_cli_urls:
             initial_targets.append({"url": u, "filename": None, "subdir": None})
 
     for item in config_files:
@@ -786,7 +1002,7 @@ def main():
 
     if not initial_targets:
         print("No Google Drive URLs or files specified!")
-        print("Provide URLs via `--urls <link1> <link2>`, `--file-list links.txt`, or in `config.yml`.")
+        print("Provide URLs via `<link1> <link2>`, `--urls <link>`, `--file-list links.txt`, or in `config.yml`.")
         parser.print_help()
         sys.exit(1)
 
@@ -815,7 +1031,7 @@ def main():
     targets = expanded_targets
 
     print(f"Starting Google Drive Downloader...")
-    print(f"Total targets: {len(targets)} | Workers: {max_workers} | Output: {output_dir}")
+    print(f"Total targets: {len(targets)} | Workers: {max_workers} | Engine: {engine} | Output: {output_dir}")
 
     downloader = GoogleDriveDownloader(
         output_dir=output_dir,
@@ -824,6 +1040,7 @@ def main():
         retry_attempts=retry_attempts,
         retry_delay=retry_delay,
         overwrite=overwrite,
+        engine=engine,
     )
 
     use_rich_ui = RICH_AVAILABLE and not args.no_progress and sys.stdout.isatty()

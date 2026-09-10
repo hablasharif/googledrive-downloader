@@ -6,7 +6,8 @@ Advanced Google Drive Multi-Link & Folder Downloader
 Author: Antigravity Assistant
 Description: High-performance, multi-threaded Google Drive file and folder
              downloader supporting large file confirmation bypass, stream
-             resumption, folder tree extraction, batch URL lists, YAML
+             resumption, folder tree extraction, batch URL lists, automatic
+             redownload of failed URLs, persistent failure logging, YAML
              configuration, and real-time progress visualization.
 =============================================================================
 """
@@ -134,7 +135,6 @@ class GoogleDriveURLParser:
                 subdir = str(p.parent) if p.parent != Path(".") else None
                 filename = p.name
 
-                # Avoid duplicate filename collisions in the same directory
                 target_key = f"{subdir}/{filename}"
                 if target_key in seen_paths:
                     stem = p.stem
@@ -200,7 +200,6 @@ class GoogleDriveDownloader:
         if not cd:
             return None
 
-        # Try RFC 5987 / UTF-8 filename*=UTF-8''...
         utf8_match = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
         if utf8_match:
             try:
@@ -208,7 +207,6 @@ class GoogleDriveDownloader:
             except Exception:
                 pass
 
-        # Try standard filename="..."
         name_match = re.search(r'filename="?([^";]+)"?', cd)
         if name_match:
             filename = name_match.group(1).strip()
@@ -285,7 +283,6 @@ class GoogleDriveDownloader:
             html_text = resp.text
             confirm_token, download_url, _ = self._parse_html_confirmation(html_text)
 
-            # Look for confirmation cookies
             if not confirm_token:
                 for k, v in session.cookies.items():
                     if k.startswith("download_warning"):
@@ -307,7 +304,7 @@ class GoogleDriveDownloader:
             if resp.status_code == 404:
                 raise FileNotFoundError("File not found or access denied (check permissions / link sharing).")
             elif resp.status_code == 403:
-                raise PermissionError("Access forbidden. File download quota may have been exceeded or requires sign-in.")
+                raise PermissionError("Access forbidden. Download quota exceeded or sign-in required.")
             elif resp.status_code == 416:
                 return resp, None, 0
             else:
@@ -579,6 +576,113 @@ def load_file_list(file_list_path: str) -> List[Dict[str, Any]]:
     return targets
 
 
+def write_failed_log(log_path: Path, failed_items: List[Dict[str, Any]]) -> None:
+    """Record persistently failed URLs and filenames into a log file."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("# ====================================================================\n")
+        f.write("# Google Drive Downloader - Persistent Failed Downloads Log\n")
+        f.write(f"# Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+        f.write(f"# Total Failed Items: {len(failed_items)}\n")
+        f.write("# ====================================================================\n\n")
+        for idx, item in enumerate(failed_items, 1):
+            file_id = item.get("file_id", "Unknown")
+            filename = item.get("filename", "Unknown")
+            error = item.get("error", "Unknown Error")
+            # Build full link
+            if file_id and len(file_id) >= 20:
+                url = f"https://drive.google.com/file/d/{file_id}/view"
+            else:
+                url = item.get("target_info", {}).get("url", file_id)
+
+            f.write(f"[{idx}] File Name: {filename}\n")
+            f.write(f"    Google Drive URL: {url}\n")
+            f.write(f"    File ID:          {file_id}\n")
+            f.write(f"    Error Reason:     {error}\n\n")
+
+
+def run_download_pass(
+    downloader: GoogleDriveDownloader,
+    targets: List[Dict[str, Any]],
+    max_workers: int,
+    use_rich_ui: bool,
+    pass_label: str = "Initial Pass",
+) -> List[Dict[str, Any]]:
+    """Execute a concurrent download pass for given targets."""
+    print(f"\n>>> Running Download: {pass_label} ({len(targets)} item(s)) <<<")
+    results: List[Dict[str, Any]] = []
+
+    if use_rich_ui:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            transient=False,
+        ) as progress:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        downloader.download_file,
+                        t["url"],
+                        t["filename"],
+                        t["subdir"],
+                        progress,
+                    ): t
+                    for t in targets
+                }
+
+                for future in as_completed(future_map):
+                    t = future_map[future]
+                    try:
+                        res = future.result()
+                        res["target_info"] = t
+                        results.append(res)
+                    except Exception as exc:
+                        results.append({
+                            "file_id": t["url"],
+                            "filename": t.get("filename", "Unknown"),
+                            "status": "Failed",
+                            "error": str(exc),
+                            "bytes_downloaded": 0,
+                            "duration": 0,
+                            "target_info": t,
+                        })
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    downloader.download_file,
+                    t["url"],
+                    t["filename"],
+                    t["subdir"],
+                    None,
+                ): t
+                for t in targets
+            }
+
+            for future in as_completed(future_map):
+                t = future_map[future]
+                try:
+                    res = future.result()
+                    res["target_info"] = t
+                    results.append(res)
+                    print(f"[{res['status']}] {res.get('filename')} ({format_size(res.get('bytes_downloaded', 0))})")
+                except Exception as exc:
+                    results.append({
+                        "file_id": t["url"],
+                        "filename": t.get("filename", "Unknown"),
+                        "status": "Failed",
+                        "error": str(exc),
+                        "bytes_downloaded": 0,
+                        "duration": 0,
+                        "target_info": t,
+                    })
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Advanced Google Drive Multi-Link & Folder Downloader",
@@ -629,6 +733,17 @@ def main():
         action="store_true",
         help="Disable interactive rich progress bars (useful for CI/GitHub Actions)",
     )
+    parser.add_argument(
+        "--failed-log",
+        type=str,
+        default="download_failed.txt",
+        help="Output text file path to record any persistently failed file names and URLs",
+    )
+    parser.add_argument(
+        "--no-retry-failed",
+        action="store_true",
+        help="Disable automatic second-pass redownload of failed URLs",
+    )
 
     args = parser.parse_args()
 
@@ -652,16 +767,13 @@ def main():
 
     initial_targets: List[Dict[str, Any]] = []
 
-    # 1. From CLI --file-list
     if args.file_list:
         initial_targets.extend(load_file_list(args.file_list))
 
-    # 2. From CLI --urls
     if args.urls:
         for u in args.urls:
             initial_targets.append({"url": u, "filename": None, "subdir": None})
 
-    # 3. From YAML config
     for item in config_files:
         if isinstance(item, str):
             initial_targets.append({"url": item, "filename": None, "subdir": None})
@@ -703,7 +815,7 @@ def main():
     targets = expanded_targets
 
     print(f"Starting Google Drive Downloader...")
-    print(f"Total files to download: {len(targets)} | Workers: {max_workers} | Output: {output_dir}")
+    print(f"Total targets: {len(targets)} | Workers: {max_workers} | Output: {output_dir}")
 
     downloader = GoogleDriveDownloader(
         output_dir=output_dir,
@@ -714,77 +826,69 @@ def main():
         overwrite=overwrite,
     )
 
-    results: List[Dict[str, Any]] = []
     use_rich_ui = RICH_AVAILABLE and not args.no_progress and sys.stdout.isatty()
 
-    if use_rich_ui:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=None),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            transient=False,
-        ) as progress:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {
-                    executor.submit(
-                        downloader.download_file,
-                        target["url"],
-                        target["filename"],
-                        target["subdir"],
-                        progress,
-                    ): target
-                    for target in targets
-                }
+    # Pass 1: Initial Download
+    results_pass1 = run_download_pass(
+        downloader=downloader,
+        targets=targets,
+        max_workers=max_workers,
+        use_rich_ui=use_rich_ui,
+        pass_label="Initial Pass",
+    )
 
-                for future in as_completed(future_map):
-                    try:
-                        res = future.result()
-                        results.append(res)
-                    except Exception as exc:
-                        target = future_map[future]
-                        results.append({
-                            "file_id": target["url"],
-                            "filename": target.get("filename", "Unknown"),
-                            "status": "Failed",
-                            "error": str(exc),
-                            "bytes_downloaded": 0,
-                            "duration": 0,
-                        })
+    # Map results by target url
+    results_dict: Dict[str, Dict[str, Any]] = {}
+    for r in results_pass1:
+        key = f"{r.get('file_id')}_{r.get('filename')}"
+        results_dict[key] = r
+
+    # Identify failures
+    failed_pass1 = [r for r in results_pass1 if r.get("status") == "Failed"]
+
+    # Pass 2: Automatic Redownload of Failed URLs
+    if failed_pass1 and not args.no_retry_failed:
+        print(f"\n[Warning] {len(failed_pass1)} download(s) failed during the initial pass.")
+        print("Initiating automatic second-pass redownload for failed URLs in 3 seconds...")
+        time.sleep(3)
+
+        retry_targets = [r["target_info"] for r in failed_pass1]
+        retry_workers = max(1, min(max_workers, 2))  # Reduce concurrency to avoid rate limiting
+
+        results_pass2 = run_download_pass(
+            downloader=downloader,
+            targets=retry_targets,
+            max_workers=retry_workers,
+            use_rich_ui=use_rich_ui,
+            pass_label="Second-Pass Redownload (Failed URLs)",
+        )
+
+        # Update results mapping with redownload outcomes
+        for r in results_pass2:
+            key = f"{r.get('file_id')}_{r.get('filename')}"
+            results_dict[key] = r
+
+    final_results = list(results_dict.values())
+    print_summary_table(final_results)
+
+    # Check for persistent failures after redownload
+    persistently_failed = [r for r in final_results if r.get("status") == "Failed"]
+    failed_log_path = Path(args.failed_log)
+
+    if persistently_failed:
+        write_failed_log(failed_log_path, persistently_failed)
+        print(f"\n[ALERT] {len(persistently_failed)} file(s) persistently failed after redownload retry.")
+        print(f"Saved failed file names and links into: {failed_log_path.resolve()}")
     else:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(
-                    downloader.download_file,
-                    target["url"],
-                    target["filename"],
-                    target["subdir"],
-                    None,
-                ): target
-                for target in targets
-            }
+        # If everything succeeded, clean up or remove stale download_failed.txt
+        if failed_log_path.exists():
+            try:
+                failed_log_path.unlink()
+            except Exception:
+                pass
+        print("\n[SUCCESS] All files downloaded successfully without failures.")
 
-            for future in as_completed(future_map):
-                try:
-                    res = future.result()
-                    results.append(res)
-                    print(f"[{res['status']}] {res.get('filename')} ({format_size(res.get('bytes_downloaded', 0))})")
-                except Exception as exc:
-                    target = future_map[future]
-                    results.append({
-                        "file_id": target["url"],
-                        "filename": target.get("filename", "Unknown"),
-                        "status": "Failed",
-                        "error": str(exc),
-                        "bytes_downloaded": 0,
-                        "duration": 0,
-                    })
-
-    print_summary_table(results)
-
-    if results and all(r.get("status") == "Failed" for r in results):
+    if persistently_failed and len(persistently_failed) == len(final_results):
         sys.exit(1)
 
 

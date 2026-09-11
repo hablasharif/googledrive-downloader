@@ -138,19 +138,38 @@ class GoogleDriveURLParser:
             return []
 
         try:
-            items = gdown.download_folder(url=folder_url, skip_download=True, quiet=True)
+            marker = "_gdrive_crawl_tmp"
+            # Using marker + os.sep forces gdown to return root_dir = osp.join(marker, gdrive_file.name)
+            # This preserves the original top-level Google Drive folder name!
+            items = gdown.download_folder(
+                url=folder_url,
+                output=marker + os.sep,
+                skip_download=True,
+                quiet=True,
+            )
             targets: List[Dict[str, Any]] = []
             seen_paths = set()
 
             for item in items:
-                p = Path(item.path)
-                subdir = str(p.parent) if p.parent != Path(".") else None
-                filename = p.name
+                if hasattr(item, "local_path") and item.local_path:
+                    rel_p = Path(os.path.relpath(item.local_path, marker))
+                    root_folder_name = rel_p.parts[0] if len(rel_p.parts) > 1 else (rel_p.parent.name or "Drive_Folder")
+                    # Subdir preserves the root folder name and any nested subfolders
+                    subdir = str(rel_p.parent) if rel_p.parent != Path(".") else root_folder_name
+                    filename = rel_p.name
+                    # Inner path relative to the root folder
+                    inner_path = str(Path(*rel_p.parts[1:-1])) if len(rel_p.parts) > 2 else None
+                else:
+                    p = Path(item.path)
+                    root_folder_name = "Drive_Folder"
+                    subdir = str(p.parent) if p.parent != Path(".") else root_folder_name
+                    filename = p.name
+                    inner_path = str(p.parent) if p.parent != Path(".") else None
 
                 target_key = f"{subdir}/{filename}"
                 if target_key in seen_paths:
-                    stem = p.stem
-                    suffix = p.suffix
+                    stem = Path(filename).stem
+                    suffix = Path(filename).suffix
                     filename = f"{stem}_{item.id[:6]}{suffix}"
                     target_key = f"{subdir}/{filename}"
                 seen_paths.add(target_key)
@@ -159,6 +178,8 @@ class GoogleDriveURLParser:
                     "url": item.id,
                     "filename": filename,
                     "subdir": subdir,
+                    "root_folder": root_folder_name,
+                    "inner_path": inner_path,
                 })
             return targets
         except Exception as e:
@@ -1016,9 +1037,14 @@ def main():
             print(f"Found {len(folder_items)} file(s) inside folder.")
 
             for fi in folder_items:
-                item_subdir = fi["subdir"]
                 if target.get("subdir"):
-                    item_subdir = str(Path(target["subdir"]) / (item_subdir or ""))
+                    inner = fi.get("inner_path")
+                    if inner:
+                        item_subdir = str(Path(target["subdir"]) / inner)
+                    else:
+                        item_subdir = target["subdir"]
+                else:
+                    item_subdir = fi["subdir"]
 
                 expanded_targets.append({
                     "url": fi["url"],

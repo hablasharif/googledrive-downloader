@@ -20,21 +20,24 @@ from googleapiclient.http import MediaFileUpload
 # ============================================================
 
 CLIENT_ID = (
-    "8250288792-7v43qpmkf0gecfgcjkl40q3s5llccuib.apps.googleusercontent.com"
+    "8250288792-ihg8ebucg4fchu7aan8ddmt0riauegvs.apps.googleusercontent.com"
 )
 
 CLIENT_SECRET = (
-    "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"
+    "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"
 )
 
-# Hardcode your refresh token here for 100% headless GitHub Actions execution
-# You can also set the GDRIVE_REFRESH_TOKEN environment variable / secret.
-REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN", "")
+# ============================================================
+# GOOGLE DRIVE REFRESH TOKEN (HARDCODED FOR PRIVATE REPO)
+# ============================================================
+HARDCODED_REFRESH_TOKEN = "1//0gNB6Ivwp-0tBCgYIARAAGBASNwF-L9IrhonNAFiD-ZIWEZhiy70c9Icd4122V0paZwIdiUACrDYbEK0jg37Ll0RX7vwe9a2_Ox8"
+REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN") or HARDCODED_REFRESH_TOKEN
 
-# OAuth scopes
+# Using drive.file scope (allows creating folders and uploading files without restricted verification)
 SCOPES = [
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive.file"
 ]
+
 
 TOKEN_FILE = "token.json"
 

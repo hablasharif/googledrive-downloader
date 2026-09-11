@@ -253,7 +253,8 @@ def get_or_create_remote_folder(service, folder_name: str, parent_id: str = None
     if cache_key in _folder_cache:
         return _folder_cache[cache_key]
 
-    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    safe_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    query = f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
     else:
@@ -387,6 +388,20 @@ def main():
         print(f"[2/3] Processing {len(urls_to_download)} URL(s)...")
         for idx, url in enumerate(urls_to_download, start=1):
             try:
+                if "/folders/" in url:
+                    print(f"  [Folder Detected] Downloading entire folder hierarchy for {url}...")
+                    from downloader import GoogleDriveURLParser, GoogleDriveDownloader
+                    items = GoogleDriveURLParser.extract_folder_items(url)
+                    dl = GoogleDriveDownloader(output_dir=upload_target_dir)
+                    for item in items:
+                        dl.download_file(
+                            item["url"],
+                            custom_filename=item["filename"],
+                            subdir=item["subdir"]
+                        )
+                    print(f"  ✅ Folder downloaded successfully ({len(items)} files)!")
+                    continue
+
                 file_id = extract_drive_file_id(url)
                 filename = f"drive_file_{file_id}" if file_id else f"drive_file_{idx}"
 
